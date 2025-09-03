@@ -1,0 +1,15 @@
+[submodule "hisat-3n"]
+	path = hisat-3n
+	url = https://github.com/DaehwanKimLab/hisat2.git
+[submodule "UMICollapse"]
+	path = UMICollapse
+	url = https://github.com/Daniel-Liu-c0deb0t/UMICollapse.git
+[submodule "samtools"]
+	path = samtools
+	url = https://github.com/samtools/samtools.git
+[submodule "sra-tools"]
+	path = sra-tools
+	url = https://github.com/ncbi/sra-tools.git
+[submodule "libdeflate"]
+	path = libdeflate
+	url = https://github.com/ebiggers/libdeflate.git
