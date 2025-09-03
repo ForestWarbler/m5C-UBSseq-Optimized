@@ -1,0 +1,806 @@
+#!/usr/bin/env python3
+"""
+Reads级别并行化Snakefile - 与串行版本匹配的修正版
+"""
+
+from snakemake.utils import min_version
+from collections import defaultdict
+from pathlib import Path
+import os
+
+min_version("8.0")
+
+configfile: Path(workflow.basedir) / "config.yaml"
+
+workdir: "workspace"
+
+BIN = config["path"]
+REF = config["reference"]
+
+# 从配置中读取样本信息
+SAMPLE2DATA = defaultdict(dict)
+SAMPLE2LIB = defaultdict(dict)
+GROUP2SAMPLE = defaultdict(list)
+SAMPLE2GROUP = {s: g for g, lst in GROUP2SAMPLE.items() for s in lst}
+
+for s, v in config["samples"].items():
+    if v.get("treated", True):
+        GROUP2SAMPLE[v.get("group", s)].append(s)
+    SAMPLE2LIB[s] = v.get("library", config.get("library", ""))
+    for i, v2 in enumerate(v.get("data", []), 1):
+        r = f"run{i}"
+        SAMPLE2DATA[s][r] = {k3: os.path.expanduser(v3) for k3, v3 in v2.items()}
+
+# 并行化配置
+N_CHUNKS = 20  # 每个run的chunk数量
+CHUNK_WIDTH = len(str(N_CHUNKS - 1))
+CHUNKS = [f"{i:0{CHUNK_WIDTH}d}" for i in range(N_CHUNKS)]
+
+WITH_UMI = config.get("library", "") in ["INLINE", "TAKARAV3"]
+MARKDUP = config.get("markdup", False)
+UMI_DIR = "/GLOBALFS/sysu_hpcscc_2/zhj/projects/ASC25_simulation/rna_2/UMICollapse"
+# Use intelligent chromosome splitting like winning solution
+CHRS = [str(c) for c in config.get("chroms", list(range(1, 23)) + ["X", "Y", "MT"])]
+N_CHR_PARALLEL = len(CHRS)  # Number of chromosome-based output files
+# N_CHR_PARALLEL = 64
+
+INTERNALDIR = Path("internal_files")
+TEMPDIR = Path(".tmp")
+TIMING_SUMMARY = "logs/rule_times.tsv"
+
+if os.environ.get("TMPDIR") is None:
+    os.environ["TMPDIR"] = str(TEMPDIR)
+
+envvars:
+    "TMPDIR",
+
+# 计时包装函数
+def timed_shell(cmd: str) -> str:
+    summary = TIMING_SUMMARY
+    tmpdir = os.environ.get("TMPDIR", ".tmp").rstrip('/')
+    
+    tpl = r"""
+    bash -lc '
+      set -euo pipefail
+      SUMMARY_FILE="__SUMMARY__"
+      mkdir -p "$(dirname "$SUMMARY_FILE")"
+      mkdir -p "__TMPDIR__"
+      
+      RULE="{rule}"
+      WC="{wildcards}"
+      HOST="$(hostname)"
+      
+      START_ISO="$(date "+%F %T")"
+      
+      TMPREPORT="$(mktemp "__TMPDIR__/time.$RULE.XXXXXX")"
+      
+      exec 3>&2
+      set +e
+      TIMEFORMAT="real=%3R user=%3U sys=%3S"
+      time ( __CMD__ 2>&3 ) 2> "$TMPREPORT"
+      rc=$?
+      set -e
+      exec 3>&-
+      
+      END_ISO="$(date "+%F %T")"
+      if [[ -s "$TMPREPORT" ]]; then
+        read -r METRICS < "$TMPREPORT"
+      else
+        METRICS="real=NA user=NA sys=NA"
+      fi
+      rm -f "$TMPREPORT"
+      
+      printf "%s\t%s\t%s\t%s\t%s\t%s\n" \
+        "$RULE" "$WC" "$HOST" "$START_ISO" "$END_ISO" "$METRICS" >> "$SUMMARY_FILE"
+      
+      exit $rc
+    '
+    """
+    return (
+        tpl.replace("__SUMMARY__", summary)
+           .replace("__TMPDIR__", tmpdir)
+           .replace("__CMD__", cmd)
+    )
+
+# Only SE reads supported - PE helper function removed
+
+print(f"=== Reads级别并行化配置 ===")
+print(f"样本数: {len(SAMPLE2DATA)}")
+print(f"每个run分割为: {N_CHUNKS} chunks")
+print(f"总并行度: {len(SAMPLE2DATA)} samples × runs × {N_CHUNKS} chunks")
+
+# Debug: Print sample information
+for sample, runs in SAMPLE2DATA.items():
+    for run, data in runs.items():
+        print(f"  {sample} {run}: SE - {list(data.keys())}")
+
+# ==================== Rules ====================
+
+# Only SE rules needed - PE rules removed
+
+rule all:
+    input:
+        expand("report_reads/mapped/{sample}.tsv", sample=SAMPLE2DATA.keys()),
+        [
+            INTERNALDIR / f"discarded_reads/{sample}_{rn}_R1.unmapped.fq.gz"
+            for sample, v in SAMPLE2DATA.items()
+            for rn, v2 in v.items()
+        ],
+        expand(
+            INTERNALDIR / "count_sites/{sample}.genome.arrow",
+            sample=SAMPLE2DATA.keys(),
+        )
+
+# ===== 0. 整条 FASTQ 修剪（先修剪，再切块，符合图示） =====
+rule cut_fastq_SE:
+    input:
+        R1=lambda wc: SAMPLE2DATA[wc.sample][wc.rn]["R1"],
+    output:
+        R1=INTERNALDIR / "trimmed/{sample}_{rn}_R1.fq.gz",
+        report="report_reads/trimming/{sample}_{rn}.json",
+    params:
+        library=lambda wc: SAMPLE2LIB[wc.sample],
+    threads: 64
+    shell:
+        timed_shell(r"""
+        mkdir -p $(dirname {output.R1}) $(dirname {output.report})
+        cutseq -t {threads} -A {params.library} -m 20 --trim-polyA --ensure-inline-barcode --auto-rc \
+          -o {output.R1} --json-file {output.report} {input.R1}
+        """)
+
+
+
+# ===== 1. 分割FASTQ文件 =====
+
+# Single-end splitting
+rule split_fastq_SE:
+    input:
+        INTERNALDIR / "trimmed/{sample}_{rn}_R1.fq.gz",
+    output:
+        chunks = temp(expand(
+            str(TEMPDIR / "split_reads_SE/{{sample}}_{{rn}}_chunk{chunk}_R1.fq.gz"),
+            chunk=CHUNKS
+        ))
+    params:
+        n_chunks = N_CHUNKS,
+        chunk_width = CHUNK_WIDTH,
+        prefix = lambda wildcards: str(TEMPDIR / f"split_reads_SE/{wildcards.sample}_{wildcards.rn}_chunk"),
+        outdir = str(TEMPDIR / "split_reads_SE"),
+        sample = lambda wildcards: wildcards.sample,
+        rn = lambda wildcards: wildcards.rn
+    threads: 8
+    shell:
+        timed_shell(r"""
+        mkdir -p {params.outdir}
+        
+        # 清理旧文件
+        rm -f {params.outdir}/{params.sample}_{params.rn}_*.fq.gz || true
+        
+        # 使用seqkit split2分割
+        echo "Splitting file into {params.n_chunks} chunks..."
+        seqkit split2 -p {params.n_chunks} -j {threads} \
+            -O {params.outdir} {input}
+        
+        # 检查生成的文件
+        echo "Files generated by seqkit:"
+        ls -la {params.outdir}/ | head -30
+        
+        # seqkit生成的文件名格式: inputbasename.part_XXX.ext
+        basename=$(basename {input})
+        basename_noext="${{basename%.fastq.gz}}"
+        if [ "$basename_noext" = "$basename" ]; then
+            basename_noext="${{basename%.fq.gz}}"
+        fi
+        
+        # 重命名为标准格式
+        for i in $(seq 1 {params.n_chunks}); do
+            part_num=$(printf "%03d" $i)
+            chunk_num=$(printf "%0{CHUNK_WIDTH}d" $((i-1)))
+            
+            # 尝试多种可能的文件名格式
+            for ext in "fastq.gz" "fq.gz"; do
+                old_file="{params.outdir}/${{basename}}.part_${{part_num}}.${{ext}}"
+                if [ ! -f "$old_file" ]; then
+                    old_file="{params.outdir}/${{basename_noext}}.part_${{part_num}}.${{ext}}"
+                fi
+                
+                if [ -f "$old_file" ]; then
+                    new_file="{params.prefix}${{chunk_num}}_R1.fq.gz"
+                    mv "$old_file" "$new_file"
+                    echo "Renamed $old_file to $new_file"
+                    break
+                fi
+            done
+            
+            # 如果还是没找到，用find命令查找
+            if [ ! -f "{params.prefix}${{chunk_num}}_R1.fq.gz" ]; then
+                found_file=$(find {params.outdir} -name "*part_${{part_num}}*" -type f | head -1)
+                if [ -n "$found_file" ]; then
+                    new_file="{params.prefix}${{chunk_num}}_R1.fq.gz"
+                    mv "$found_file" "$new_file"
+                    echo "Found and renamed $found_file to $new_file"
+                else
+                    echo "[WARNING] No file found for part $part_num" >&2
+                fi
+            fi
+        done
+        
+        # 验证
+        cnt=$(ls {params.prefix}*_R1.fq.gz 2>/dev/null | wc -l)
+        if [ "$cnt" -ne "{params.n_chunks}" ]; then
+            echo "[ERROR] Expected {params.n_chunks} chunks, got $cnt" >&2
+            echo "Files in output directory:" >&2
+            ls -la {params.outdir}/ >&2
+            exit 1
+        fi
+        
+        echo "Successfully created {params.n_chunks} chunks"
+        """)
+
+
+
+
+# ===== 3. Mapping chunks (SE) =====
+
+rule hisat2_3n_mapping_contamination_chunk_SE:
+    input:
+        TEMPDIR / "split_reads_SE/{sample}_{rn}_chunk{chunk}_R1.fq.gz",
+    output:
+        mapped = temp(TEMPDIR / "mapping_chunks_SE/{sample}_{rn}_chunk{chunk}.contamination.bam"),
+        unmapped = temp(TEMPDIR / "mapping_discarded_chunks_SE/{sample}_{rn}_chunk{chunk}.contamination.bam"),
+        summary = temp(TEMPDIR / "summaries_chunks/{sample}_{rn}_chunk{chunk}.contamination.summary"),
+    params:
+        index = REF["contamination"]["hisat3n"],
+    threads: 8
+    shell:
+        timed_shell("""
+        mkdir -p $(dirname {output.mapped})
+        
+        {BIN[hisat3n]} --index {params.index} -p {threads} \\
+          --summary-file {output.summary} --new-summary -q -U {input} \\
+          --directional-mapping --base-change C,T --mp 8,2 --no-spliced-alignment | \\
+        {BIN[samtools]} view -@ {threads} -e '!flag.unmap' -O BAM -U {output.unmapped} -o {output.mapped}
+        """)
+
+rule extract_unmap_chunk_SE:
+    input:
+        TEMPDIR / "mapping_discarded_chunks_SE/{sample}_{rn}_chunk{chunk}.{reftype}.bam",
+    output:
+        temp(TEMPDIR / "unmapped_chunks_SE/{sample}_{rn}_chunk{chunk}_R1.{reftype}.fq.gz"),
+    threads: 2
+    shell:
+        timed_shell("""
+        {BIN[samtools]} fastq -@ {threads} -0 {output} {input}
+        """)
+
+rule hisat2_3n_mapping_genome_chunk_SE:
+    input:
+        TEMPDIR / "unmapped_chunks_SE/{sample}_{rn}_chunk{chunk}_R1.contamination.fq.gz",
+    output:
+        mapped = temp(TEMPDIR / "mapping_chunks_SE/{sample}_{rn}_chunk{chunk}.genome.bam"),
+        unmapped = temp(TEMPDIR / "mapping_discarded_chunks_SE/{sample}_{rn}_chunk{chunk}.genome.bam"),
+        summary = temp(TEMPDIR / "summaries_chunks/{sample}_{rn}_chunk{chunk}.genome.summary"),
+    params:
+        index = REF["genome"]["hisat3n"],
+    threads: 8
+    shell:
+        timed_shell("""
+        {BIN[hisat3n]} --index {params.index} -p {threads} \\
+          --summary-file {output.summary} --new-summary -q -U {input} \\
+          --directional-mapping --base-change C,T --pen-noncansplice 20 --mp 4,1 | \\
+        {BIN[samtools]} view -@ {threads} -e '!flag.unmap' -O BAM -U {output.unmapped} -o {output.mapped}
+        """)
+
+# ===== 4. Mapping chunks (PE) =====
+
+
+
+
+
+
+
+# ===== 5. 合并chunks的mapping结果 =====
+
+rule merge_mapped_chunks_SE:
+    input:
+        lambda wildcards: expand(
+            str(TEMPDIR / "mapping_chunks_SE/{{sample}}_{{rn}}_chunk{chunk}.{{ref}}.bam"),
+            chunk=CHUNKS
+        )
+    output:
+        temp(TEMPDIR / "mapping_unsorted_SE/{sample}_{rn}.{ref}.bam")
+    threads: 6
+    shell:
+        timed_shell("""
+        mkdir -p $(dirname {output})
+        
+        echo "Merging {N_CHUNKS} SE chunks into single BAM..."
+        if [ {N_CHUNKS} -eq 1 ]; then
+            cp {input} {output}
+        else
+            {BIN[samtools]} merge -@ {threads} -o {output} {input}
+        fi
+        
+        # Verify the output file exists
+        if [ ! -f {output} ]; then
+            echo "[ERROR] Failed to create merged BAM file" >&2
+            exit 1
+        fi
+        
+        reads_count=$({BIN[samtools]} view -c {output} 2>/dev/null || echo 0)
+        echo "Merged {N_CHUNKS} chunks for {wildcards.ref}, total reads: $reads_count"
+        """)
+
+
+
+# ===== 6. 合并discarded reads chunks =====
+
+rule merge_discarded_chunks:
+    input:
+        lambda wildcards: expand(
+            TEMPDIR / "discarded_chunks_SE/{sample}_{rn}_chunk{chunk}_{read}.{ext}",
+            sample=wildcards.sample,
+            rn=wildcards.rn,
+            chunk=CHUNKS,
+            read=wildcards.read,
+            ext=wildcards.ext
+        )
+    output:
+        INTERNALDIR / "discarded_reads/{sample}_{rn}_{read}.{ext}"
+    shell:
+        timed_shell("""
+        mkdir -p $(dirname {output})
+        cat {input} > {output}
+        """)
+
+# 合并unmapped genome reads
+rule merge_unmapped_final:
+    input:
+        lambda wildcards: expand(
+            TEMPDIR / "unmapped_chunks_SE/{sample}_{rn}_chunk{chunk}_{read}.genome.fq.gz",
+            sample=wildcards.sample,
+            rn=wildcards.rn,
+            chunk=CHUNKS,
+            read=wildcards.read
+        )
+    output:
+        INTERNALDIR / "discarded_reads/{sample}_{rn}_{read}.unmapped.fq.gz"
+    shell:
+        timed_shell("""
+        mkdir -p $(dirname {output})
+        cat {input} > {output}
+        """)
+
+# 合并trimming reports
+# rule merge_trimming_reports:
+#     input:
+#         lambda wildcards: expand(
+#             TEMPDIR / "reports_chunks/{sample}_{rn}_chunk{chunk}.{ext}",
+#             sample=wildcards.sample,
+#             rn=wildcards.rn,
+#             chunk=CHUNKS,
+#             ext="json" if "R2" not in SAMPLE2DATA[wildcards.sample][wildcards.rn] else "report"
+#         )
+#     output:
+#         "report_reads/trimming/{sample}_{rn}.{ext}"
+#     wildcard_constraints:
+#         ext="json|report"
+#     shell:
+#         timed_shell("""
+#         mkdir -p $(dirname {output})
+#         # 简单合并，实际使用时可能需要更复杂的合并逻辑
+#         cat {input} > {output}
+#         """)
+
+# 合并mapping summaries
+rule merge_mapping_summaries:
+    input:
+        lambda wildcards: expand(
+            TEMPDIR / "summaries_chunks/{sample}_{rn}_chunk{chunk}.{ref}.summary",
+            sample=wildcards.sample,
+            rn=wildcards.rn,
+            chunk=CHUNKS,
+            ref=wildcards.ref
+        )
+    output:
+        "report_reads/mapping/{sample}_{rn}.{ref}.summary"
+    shell:
+        timed_shell("""
+        mkdir -p $(dirname {output})
+        # 合并summary文件 - 需要根据实际格式调整
+        cat {input} > {output}
+        """)
+
+# ===== 从这里开始与原始串行workflow相同 =====
+
+# Sort
+rule hisat2_3n_sort:
+    input:
+        TEMPDIR / "mapping_unsorted_SE/{sample}_{rn}.{ref}.bam",
+    output:
+        INTERNALDIR / "run_sorted/{sample}_{rn}.{ref}.bam",
+    params:
+        tmp=os.environ["TMPDIR"],
+    threads: 16
+    shell:
+        timed_shell(r"""
+        mkdir -p "$(dirname {output})"
+        {BIN[samtools]} sort -@ {threads} -T "{params.tmp}/sort.{wildcards.sample}.{wildcards.rn}.{wildcards.ref}" \
+          --write-index -m 10G -O BAM -o {output} {input}
+        """)
+
+# combine_runs rule removed - only single SRR runs expected
+
+# ===== 4.1 智能染色体切分（类似获奖作品） =====
+
+rule split_bam_intelligent:
+    input:
+        bam = lambda wildcards: INTERNALDIR / f"run_sorted/{wildcards.sample}_run1.{wildcards.ref}.bam",
+    output:
+        bams = expand(INTERNALDIR / "split/{{sample}}.{{ref}}.sorted.split.{chr_id}.bam",
+                      chr_id=range(N_CHR_PARALLEL)),
+    params:
+        # 二进制的绝对路径（你提供的编译产物路径）
+        exe = "/GLOBALFS/sysu_hpcscc_2/zhj/projects/ASC25_simulation/rna_2/m5C-UBSseq/bin/merge_split_bam/merge_split_bam",
+        # 输入前缀调整为直接使用排序后的BAM
+        input_prefix  = lambda wc: str(INTERNALDIR / f"run_sorted/{wc.sample}_run1.{wc.ref}"),
+        # 输出前缀：二进制会在该前缀下生成 .sorted.split.X.bam
+        output_prefix = lambda wc: str(INTERNALDIR / f"split/{wc.sample}.{wc.ref}"),
+        # 若 htslib 不在系统库路径，按需设置其 lib 目录（没有就留空字符串）
+        htslib_lib    = config.get("htslib_lib", "")
+    threads: 64
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "$(dirname {output[0]})"
+
+        # 把单个输入 BAM 映射成 <output_prefix>.0.bam，方便二进制用同一前缀读写
+        INPUT_LINK="{params.output_prefix}.0.bam"
+        ln -sf "$(realpath {input.bam})" "$INPUT_LINK"
+
+        # 如果需要，为运行时链接器补上 htslib 的目录
+        export OMP_NUM_THREADS={threads}
+        if [ -n "{params.htslib_lib}" ]; then
+            export LD_LIBRARY_PATH="{params.htslib_lib}:$LD_LIBRARY_PATH"
+        fi
+
+        # 运行 C++ 版本：<prefix> <input_num> <output_num> [--out BAM|SAM]
+        "{params.exe}" "{params.output_prefix}" 1 {N_CHR_PARALLEL} --out BAM
+
+        # 清除临时软链接
+        rm -f "$INPUT_LINK"
+        """
+
+
+# Deduplication on each split file
+rule umi_dedup_split:
+    input:
+        bam = INTERNALDIR / "split/{sample}.{ref}.sorted.split.{chr_id}.bam",
+    output:
+        bam = INTERNALDIR / "split_dedup/{sample}.{ref}.split.{chr_id}.bam",
+        log = "report_reads/dedup/{sample}.{ref}.split.{chr_id}.log",
+    params:
+        tmp=os.environ.get("TMPDIR", ".tmp"),
+        with_umi=WITH_UMI,
+        markdup=MARKDUP,
+        umi_dir=UMI_DIR if WITH_UMI else "",
+    threads: 8
+    shell:
+        timed_shell(r"""
+        mkdir -p $(dirname {output.bam}) $(dirname {output.log})
+        
+        if [ "{params.with_umi}" = "True" ]; then
+            java -server -Xms2G -Xmx12G -Xss64M -Djava.io.tmpdir={params.tmp} \
+            -cp "{params.umi_dir}/lib/*:{params.umi_dir}/umicollapse.jar" \
+            umicollapse.main.Main bam \
+              -t 2 -T {threads} --data naive --merge avgqual --two-pass \
+              -i {input.bam} -o {output.bam} 2>&1 | tee {output.log}
+              
+            # Check if output file was created
+            if [ ! -f {output.bam} ]; then
+                echo "[ERROR] UMICollapse failed to create output BAM file" >&2
+                exit 1
+            fi
+        elif [ "{params.markdup}" = "True" ]; then
+            java -Xmx8G -jar ~/tools/gatk-4.2.5.0/gatk-package-4.2.5.0-local.jar MarkDuplicates \
+                -I {input.bam} -O {output.bam} -M {output.log} \
+                --DUPLICATE_SCORING_STRATEGY SUM_OF_BASE_QUALITIES \
+                --REMOVE_DUPLICATES true --VALIDATION_STRINGENCY SILENT \
+                --TMP_DIR {params.tmp}
+        else
+            cp {input.bam} {output.bam}
+            echo "no-dedup" > {output.log}
+        fi
+        """)
+
+# Statistics
+rule stat_mapping_number:
+    input:
+        bam=lambda wildcards: [
+            INTERNALDIR / f"run_sorted/{wildcards.sample}_run1.{ref}.bam"
+            for ref in ["contamination", "genome"]
+        ],
+    output:
+        tsv="report_reads/mapped/{sample}.tsv",
+    params:
+        refs=["contamination", "genome"],
+    threads: 4
+    shell:
+        timed_shell(r"""
+        mkdir -p "$(dirname {output})"
+        paste <(echo {params.refs} |  tr " " "\\n") <(echo {input.bam} |  tr " " "\\n") | while read ref file; do
+            cnt=$({BIN[samtools]} view -@ {threads} -F 3980 -c "$file")
+            printf "%s\t%s\n" "$ref" "$cnt" >> {output}
+        done
+        """)
+
+# Deduplication
+# rule dedup_mapping:
+#     input:
+#         bam=TEMPDIR / "combined_mapping/{sample}.{ref}.bam",
+#     output:
+#         bam=INTERNALDIR / "aligned_bam/{sample}.{ref}.bam",
+#         txt="report_reads/dedup/{sample}.{ref}.log",
+#     params:
+#         tmp=os.environ["TMPDIR"],
+#     threads: 20
+#     run:
+#         if WITH_UMI:
+#             shell(timed_shell(r"""
+#                 mkdir -p "$(dirname {output.bam})" "$(dirname {output.txt})"
+#                 java -server -Xms8G -Xmx40G -Xss100M -Djava.io.tmpdir=.tmp \
+#                 -cp "{UMI_DIR}/lib/*:{UMI_DIR}/umicollapse.jar" \
+#                 umicollapse.main.Main bam \
+#                 -t 2 -T {threads} --data naive --merge avgqual --two-pass \
+#                 -i {input.bam} -o {output.bam} > {output.txt}
+#             """))
+#         elif MARKDUP:
+#             shell(timed_shell(r"""
+#                 mkdir -p "$(dirname {output.bam})" "$(dirname {output.txt})"
+#                 java -Xmx36G -jar ~/tools/gatk-4.2.5.0/gatk-package-4.2.5.0-local.jar MarkDuplicates \
+#                     -I {input} -O {output.bam} -M {output.txt} \
+#                     --DUPLICATE_SCORING_STRATEGY SUM_OF_BASE_QUALITIES \
+#                     --REMOVE_DUPLICATES true --VALIDATION_STRINGENCY SILENT \
+#                     --TMP_DIR {params.tmp}
+#             """))
+#         else:
+#             shell(timed_shell(r"""
+#                 mkdir -p "$(dirname {output.bam})" "$(dirname {output.txt})"
+#                 cp {input.bam} {output.bam}
+#                 touch {output.txt}
+#             """))
+
+# rule dedup_index:
+#     input:
+#         bam=INTERNALDIR / "aligned_bam/{sample}.{ref}.bam",
+#     output:
+#         bai=INTERNALDIR / "aligned_bam/{sample}.{ref}.bam.bai",
+#     threads: 6
+#     shell:
+#         timed_shell("""
+#         {BIN[samtools]} index -@ {threads} {input}
+#         """)
+
+# ===== 4.2 对每个分割文件并行做calling =====
+
+rule hisat2_3n_calling_unfiltered_unique_split:
+    input:
+        INTERNALDIR / "split_dedup/{sample}.{ref}.split.{chr_id}.bam",
+    output:
+        temp(TEMPDIR / "unfiltered_unique_split/{sample}.{ref}.split.{chr_id}.tsv.gz"),
+    params:
+        fa=lambda wc: REF[wc.ref]["fa"],
+    threads: 1
+    shell:
+        timed_shell(r"""
+        {BIN[samtools]} view -e "rlen<100000" -h {input} | \
+        {BIN[hisat3ntable]} -p {threads} -u --alignments - --ref {params.fa} --output-name /dev/stdout --base-change C,T | \
+        cut -f 1,2,3,5,7 | bgzip -@ {threads} -c > {output}
+        """)
+
+rule hisat2_3n_calling_unfiltered_multi_split:
+    input:
+        INTERNALDIR / "split_dedup/{sample}.{ref}.split.{chr_id}.bam",
+    output:
+        temp(TEMPDIR / "unfiltered_multi_split/{sample}.{ref}.split.{chr_id}.tsv.gz"),
+    params:
+        fa=lambda wc: REF[wc.ref]["fa"],
+    threads: 1
+    shell:
+        timed_shell(r"""
+        {BIN[samtools]} view -e "rlen<100000" -h {input} | \
+        {BIN[hisat3ntable]} -p {threads} -m --alignments - --ref {params.fa} --output-name /dev/stdout --base-change C,T | \
+        cut -f 1,2,3,5,7 | bgzip -@ {threads} -c > {output}
+        """)
+
+rule hisat2_3n_filtering_split:
+    input:
+        INTERNALDIR / "split_dedup/{sample}.{ref}.split.{chr_id}.bam",
+    output:
+        temp(TEMPDIR / "hisat_converted_split/{sample}.{ref}.split.{chr_id}.bam"),
+    threads: 6
+    shell:
+        timed_shell(r"""
+        {BIN[samtools]} view -@ {threads} -e "[XM] * 20 <= (qlen-sclen) && [Zf] <= 3 && 3 * [Zf] <= [Zf] + [Yf]" \
+          {input} -O BAM -o {output}
+        """)
+
+rule hisat2_3n_calling_filtered_unique_split:
+    input:
+        TEMPDIR / "hisat_converted_split/{sample}.{ref}.split.{chr_id}.bam",
+    output:
+        temp(TEMPDIR / "filtered_unique_split/{sample}.{ref}.split.{chr_id}.tsv.gz"),
+    params:
+        fa=lambda wc: REF[wc.ref]["fa"],
+    threads: 1
+    shell:
+        timed_shell(r"""
+        {BIN[samtools]} view -e "rlen<100000" -h {input} | \
+        {BIN[hisat3ntable]} -p {threads} -u --alignments - --ref {params.fa} --output-name /dev/stdout --base-change C,T | \
+        cut -f 1,2,3,5,7 | bgzip -@ {threads} -c > {output}
+        """)
+
+rule hisat2_3n_calling_filtered_multi_split:
+    input:
+        TEMPDIR / "hisat_converted_split/{sample}.{ref}.split.{chr_id}.bam",
+    output:
+        temp(TEMPDIR / "filtered_multi_split/{sample}.{ref}.split.{chr_id}.tsv.gz"),
+    params:
+        fa=lambda wc: REF[wc.ref]["fa"],
+    threads: 1
+    shell:
+        timed_shell(r"""
+        {BIN[samtools]} view -e "rlen<100000" -h {input} | \
+        {BIN[hisat3ntable]} -p {threads} -m --alignments - --ref {params.fa} --output-name /dev/stdout --base-change C,T | \
+        cut -f 1,2,3,5,7 | bgzip -@ {threads} -c > {output}
+        """)
+
+# Merge split results back together
+rule merge_unfiltered_uniq_tsv:
+    input:
+        lambda wc: expand(TEMPDIR / "unfiltered_unique_split/{sample}.{ref}.split.{chr_id}.tsv.gz",
+                          sample=wc.sample, ref=wc.ref, chr_id=range(N_CHR_PARALLEL)),
+    output:
+        TEMPDIR / "unfiltered_unique/{sample}.{ref}.tsv.gz",
+    shell:
+        timed_shell(r"""
+        mkdir -p $(dirname {output})
+        zcat {input} | bgzip -c > {output}
+        """)
+
+rule merge_unfiltered_multi_tsv:
+    input:
+        lambda wc: expand(TEMPDIR / "unfiltered_multi_split/{sample}.{ref}.split.{chr_id}.tsv.gz",
+                          sample=wc.sample, ref=wc.ref, chr_id=range(N_CHR_PARALLEL)),
+    output:
+        TEMPDIR / "unfiltered_multi/{sample}.{ref}.tsv.gz",
+    shell:
+        timed_shell(r"""
+        mkdir -p $(dirname {output})
+        zcat {input} | bgzip -c > {output}
+        """)
+
+rule merge_filtered_uniq_tsv:
+    input:
+        lambda wc: expand(TEMPDIR / "filtered_unique_split/{sample}.{ref}.split.{chr_id}.tsv.gz",
+                          sample=wc.sample, ref=wc.ref, chr_id=range(N_CHR_PARALLEL)),
+    output:
+        TEMPDIR / "filtered_unique/{sample}.{ref}.tsv.gz",
+    shell:
+        timed_shell(r"""
+        mkdir -p $(dirname {output})
+        zcat {input} | bgzip -c > {output}
+        """)
+
+rule merge_filtered_multi_tsv:
+    input:
+        lambda wc: expand(TEMPDIR / "filtered_multi_split/{sample}.{ref}.split.{chr_id}.tsv.gz",
+                          sample=wc.sample, ref=wc.ref, chr_id=range(N_CHR_PARALLEL)),
+    output:
+        TEMPDIR / "filtered_multi/{sample}.{ref}.tsv.gz",
+    shell:
+        timed_shell(r"""
+        mkdir -p $(dirname {output})
+        zcat {input} | bgzip -c > {output}
+        """)
+
+
+# Join pileups
+rule join_pileup:
+    input:
+        lambda wildcards: [
+            TEMPDIR / f"{t}/{wildcards.sample}.{wildcards.ref}.tsv.gz"
+            for t in [
+                "unfiltered_unique",
+                "unfiltered_multi",
+                "filtered_unique",
+                "filtered_multi",
+            ]
+        ],
+    output:
+        INTERNALDIR / "count_sites/{sample}.{ref}.arrow",
+    threads: 6
+    shell:
+        """
+        mkdir -p $(dirname {output})
+        
+        # Test if polars is available
+        echo "Testing polars availability..."
+        python -c "import polars; print('polars version:', polars.__version__)" || {{
+            echo "[ERROR] polars library not available" >&2
+            echo "Python version: $(python --version)" >&2
+            echo "Python path: $(which python)" >&2
+            echo "Available packages:" >&2
+            python -c "import sys; print('\\n'.join(sys.path))" >&2 || true
+            exit 1
+        }}
+        
+        # Check input files first
+        echo "Checking input files..."
+        for f in {input}; do
+            if [ ! -f "$f" ]; then
+                echo "[ERROR] Input file missing: $f" >&2
+                exit 1
+            fi
+            size=$(stat -c%s "$f" 2>/dev/null || echo 0)
+            echo "Input file $f: $size bytes"
+        done
+        
+        # Run join_pileup with error checking
+        echo "Running join_pileup.py..."
+        {BIN[join_pileup.py]} -i {input} -o {output} || {{
+            echo "[ERROR] join_pileup.py execution failed" >&2
+            exit 1
+        }}
+        
+        # Check if output file was created
+        if [ ! -f {output} ]; then
+            echo "[ERROR] join_pileup.py failed to create output file" >&2
+            exit 1
+        fi
+        
+        echo "Successfully created: {output}"
+        """
+
+# # Group pileup
+# rule group_pileup:
+#     input:
+#         lambda wildcards: [
+#             INTERNALDIR / f"count_sites/{sample}.{wildcards.ref}.arrow"
+#             for sample in GROUP2SAMPLE[wildcards.group]
+#         ],
+#     output:
+#         INTERNALDIR / "group_sites/{group}.{ref}.arrow",
+#     threads: 6
+#     shell:
+#         timed_shell("""
+#         {BIN[group_pileup.py]} -i {input} -o {output}
+#         """)
+
+# # Combined select sites
+# rule combined_select_sites:
+#     input:
+#         expand(
+#             INTERNALDIR / "group_sites/{group}.{{ref}}.arrow",
+#             group=GROUP2SAMPLE.keys(),
+#         ),
+#     output:
+#         "detected_sites/prefilter/{ref}.tsv",
+#     shell:
+#         timed_shell("""
+#         {BIN[select_sites.py]} -i {input} -o {output}
+#         """)
+
+# # Final filtering with background
+# rule stat_sample_background:
+#     input:
+#         site=INTERNALDIR / "count_sites/{sample}.{ref}.arrow",
+#         mask="detected_sites/prefilter/{ref}.tsv",
+#     output:
+#         background="detected_sites/background/{sample}.{ref}.tsv",
+#         filtered="detected_sites/filtered/{sample}.{ref}.tsv",
+#     threads: 2
+#     shell:
+#         timed_shell("""
+#         {BIN[filter_sites.py]} -i {input.site} -m {input.mask} -b {output.background} -o {output.filtered}
+#         """)

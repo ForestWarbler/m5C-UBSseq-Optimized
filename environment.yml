@@ -1,0 +1,6 @@
+name: myenv
+channels:
+  - bioconda
+  - conda-forge
+  - defaults
+prefix: /GLOBALFS/sysu_hpcscc_2/zhj/softwares/conda/2025-07-28/envs/myenv
